@@ -27,14 +27,19 @@ class SpineLeafTopo(Topo):
         h3 = self.addHost('h3', ip='10.0.0.3')
 
         # Connect hosts to leaf switches
-        self.addLink(h1, leaf1)
-        self.addLink(h2, leaf2)
-        self.addLink(h3, leaf3)
+        self.addLink(h1, leaf1, cls=TCLink, bw=10)
+        self.addLink(h2, leaf2, cls=TCLink, bw=10)
+        self.addLink(h3, leaf3, cls=TCLink, bw=10)
 
 if __name__ == '__main__':
     setLogLevel('info')
     topo = SpineLeafTopo()
-    net = Mininet(topo=topo, controller=RemoteController, link=TCLink)
+
+    # Explicit controller connection
+    net = Mininet(topo=topo,
+                  controller=lambda name: RemoteController(name, ip='127.0.0.1', port=6633),
+                  link=TCLink)
+
     net.start()
     CLI(net)
     net.stop()
