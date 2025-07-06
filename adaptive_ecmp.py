@@ -8,6 +8,7 @@ from ryu.topology.api import get_switch, get_link
 from ryu.lib.packet import packet, ethernet, ipv4
 from ryu.lib import hub
 import networkx as nx
+import time
 
 
 class AdaptiveECMP(app_manager.RyuApp):
@@ -20,6 +21,12 @@ class AdaptiveECMP(app_manager.RyuApp):
         self.port_stats = {}
         self.datapaths = {}
         self.mac_to_port = {}
+        self.packet_counts = {}      # (src, dst): count
+        self.rtt_stats = {}          # (src, dst): [list of RTTs]
+        self.link_tx_prev = {}       # (dpid, port): (tx_bytes, timestamp)
+        self.link_util = {"s1": 0.0, "s2": 0.0}  # utilization in %
+        self.port_speed = 10_000_000  # 10 Mbps in bits
+        self.echo_sent = time.time()
         self.monitor_thread = hub.spawn(self._monitor)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -29,7 +36,7 @@ class AdaptiveECMP(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # FLOOD all unmatched packets (fallback for ping/arp)
+        # FLOOD all unmatched packets
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
@@ -57,7 +64,31 @@ class AdaptiveECMP(app_manager.RyuApp):
         while True:
             for dp in self.datapaths.values():
                 self._request_stats(dp)
+                self._send_echo_request(dp)
+            self._print_stats()
             hub.sleep(self.STATS_INTERVAL)
+
+    def _print_stats(self):
+        self.logger.info("\n------ Network Stats ------")
+        for (src, dst), count in self.packet_counts.items():
+            rtts = self.rtt_stats.get((src, dst), [])
+            avg_rtt = sum(rtts) / len(rtts) if rtts else 0
+            max_rtt = max(rtts) if rtts else 0
+            self.logger.info("Flow %s -> %s: Packets=%d, Avg RTT=%.2f ms, Max RTT=%.2f ms", src, dst, count, avg_rtt, max_rtt)
+
+        self.logger.info("Spine-1 Utilization: %.2f %%", self.link_util.get("s1", 0.0))
+        self.logger.info("Spine-2 Utilization: %.2f %%", self.link_util.get("s2", 0.0))
+
+    def _send_echo_request(self, datapath):
+        self.echo_sent = time.time()
+        req = datapath.ofproto_parser.OFPEchoRequest(datapath, data=b'')
+        datapath.send_msg(req)
+
+    @set_ev_cls(ofp_event.EventOFPEchoReply, MAIN_DISPATCHER)
+    def _echo_reply_handler(self, ev):
+        rtt = (time.time() - self.echo_sent) * 1000  # ms
+        dpid = ev.msg.datapath.id
+        self.logger.info("[RTT] Switch %s echo RTT = %.2f ms", dpid, rtt)
 
     def _request_stats(self, datapath):
         parser = datapath.ofproto_parser
@@ -67,8 +98,23 @@ class AdaptiveECMP(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
         dpid = ev.msg.datapath.id
-        self.port_stats[dpid] = {stat.port_no: stat.tx_bytes for stat in ev.msg.body}
-        self.logger.debug("[STATS] Port stats updated for switch %s", dpid)
+        now = time.time()
+        for stat in ev.msg.body:
+            port_no = stat.port_no
+            tx_bytes = stat.tx_bytes
+            key = (dpid, port_no)
+
+            if key in self.link_tx_prev:
+                tx_diff = tx_bytes - self.link_tx_prev[key][0]
+                time_diff = now - self.link_tx_prev[key][1]
+                if time_diff > 0:
+                    bw_bps = (tx_diff * 8) / time_diff
+                    utilization = (bw_bps / self.port_speed) * 100
+                    sw_name = f"s{dpid}"
+                    if sw_name in self.link_util:
+                        self.link_util[sw_name] = round(utilization, 2)
+
+            self.link_tx_prev[key] = (tx_bytes, now)
 
     def _get_least_utilized_path(self, src, dst):
         try:
@@ -100,7 +146,7 @@ class AdaptiveECMP(app_manager.RyuApp):
         eth = pkt.get_protocol(ethernet.ethernet)
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
         if not ip_pkt:
-            return  # Ignore non-IP packets (e.g., ARP already handled by flood rule)
+            return
 
         dst_mac = eth.dst
         src_mac = eth.src
@@ -115,10 +161,11 @@ class AdaptiveECMP(app_manager.RyuApp):
             if dst_mac in mac_table:
                 dst_dpid = sw_id
                 break
-        
+
+        key = (src_mac, dst_mac)
+        self.packet_counts[key] = self.packet_counts.get(key, 0) + 1
 
         if dst_dpid is None:
-
             self.logger.info("[MAC_LOOKUP] Destination MAC %s unknown — flooding", dst_mac)
             actions = [datapath.ofproto_parser.OFPActionOutput(datapath.ofproto.OFPP_FLOOD)]
             out = datapath.ofproto_parser.OFPPacketOut(
@@ -130,7 +177,6 @@ class AdaptiveECMP(app_manager.RyuApp):
             )
             datapath.send_msg(out)
             return
-
 
         path = self._get_least_utilized_path(dpid, dst_dpid)
         if not path or len(path) < 2:
@@ -150,7 +196,6 @@ class AdaptiveECMP(app_manager.RyuApp):
             dp.send_msg(mod)
             self.logger.info("[FLOW] Rule installed: sw=%s dst_mac=%s -> port %s", curr_sw, dst_mac, out_port)
 
-        # Forward original packet immediately
         out_port = self.graph[dpid][path[1]]['port']
         actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
         out = datapath.ofproto_parser.OFPPacketOut(
