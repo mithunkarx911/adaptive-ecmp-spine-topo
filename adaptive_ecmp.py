@@ -21,9 +21,9 @@ class AdaptiveECMP(app_manager.RyuApp):
         self.port_stats = {}
         self.datapaths = {}
         self.mac_to_port = {}
-        self.packet_counts = {}      # (src, dst): count
-        self.rtt_stats = {}          # (src, dst): [list of RTTs]
-        self.link_tx_prev = {}       # (dpid, port): (tx_bytes, timestamp)
+        self.flow_counters = {}       # (src, dst): {'sent': 0, 'recv': 0, 'bytes': 0}
+        self.rtt_stats = {}           # (src, dst): [list of RTTs]
+        self.link_tx_prev = {}        # (dpid, port): (tx_bytes, timestamp)
         self.link_util = {"s1": 0.0, "s2": 0.0}  # utilization in %
         self.port_speed = 10_000_000  # 10 Mbps in bits
         self.echo_sent = time.time()
@@ -36,13 +36,11 @@ class AdaptiveECMP(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # FLOOD all unmatched packets
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         mod = parser.OFPFlowMod(datapath=datapath, priority=0, match=match, instructions=inst)
         datapath.send_msg(mod)
-
         self.logger.info("[BOOT] Default FLOOD rule installed on switch %s", datapath.id)
 
     @set_ev_cls(event.EventSwitchEnter)
@@ -70,11 +68,17 @@ class AdaptiveECMP(app_manager.RyuApp):
 
     def _print_stats(self):
         self.logger.info("\n------ Network Stats ------")
-        for (src, dst), count in self.packet_counts.items():
+        for (src, dst), data in self.flow_counters.items():
             rtts = self.rtt_stats.get((src, dst), [])
             avg_rtt = sum(rtts) / len(rtts) if rtts else 0
             max_rtt = max(rtts) if rtts else 0
-            self.logger.info("Flow %s -> %s: Packets=%d, Avg RTT=%.2f ms, Max RTT=%.2f ms", src, dst, count, avg_rtt, max_rtt)
+            sent = data.get('sent', data['recv'])
+            recv = data['recv']
+            loss_pct = ((sent - recv) / sent * 100) if sent > 0 else 0
+            throughput_mbps = (data['bytes'] * 8) / (self.STATS_INTERVAL * 1_000_000)
+
+            self.logger.info("Flow %s -> %s: Packets=%d, Loss=%.2f%%, Avg RTT=%.2f ms, Max RTT=%.2f ms, Throughput=%.2f Mbps",
+                             src, dst, recv, loss_pct, avg_rtt, max_rtt, throughput_mbps)
 
         self.logger.info("Spine-1 Utilization: %.2f %%", self.link_util.get("s1", 0.0))
         self.logger.info("Spine-2 Utilization: %.2f %%", self.link_util.get("s2", 0.0))
@@ -163,7 +167,9 @@ class AdaptiveECMP(app_manager.RyuApp):
                 break
 
         key = (src_mac, dst_mac)
-        self.packet_counts[key] = self.packet_counts.get(key, 0) + 1
+        flow = self.flow_counters.setdefault(key, {'sent': 0, 'recv': 0, 'bytes': 0})
+        flow['recv'] += 1
+        flow['bytes'] += len(msg.data)
 
         if dst_dpid is None:
             self.logger.info("[MAC_LOOKUP] Destination MAC %s unknown — flooding", dst_mac)
@@ -207,3 +213,4 @@ class AdaptiveECMP(app_manager.RyuApp):
         )
         datapath.send_msg(out)
         self.logger.info("[FORWARD] Sent packet from %s to %s via port %s", src_mac, dst_mac, out_port)
+
