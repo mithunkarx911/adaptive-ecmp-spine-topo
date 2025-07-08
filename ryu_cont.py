@@ -20,7 +20,7 @@ class AdaptiveECMP(app_manager.RyuApp):
     CONGESTION_PENALTY_FACTOR = 100 # Multiplier for weight if congested (makes path very undesirable)
     
     # Default port speed in bits per second (e.g., 1 Gbps)
-    DEFAULT_PORT_SPEED_BPS = 1_000_000_000
+    DEFAULT_PORT_SPEED_BPS = 10_000_000
 
     def __init__(self, *args, **kwargs):
         super(AdaptiveECMP, self).__init__(*args, **kwargs)
